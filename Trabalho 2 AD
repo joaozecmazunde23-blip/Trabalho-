@@ -1,0 +1,198 @@
+# ==============================================================================
+# Trabalho Prático II - Análise de Dados: TESTES DE HIPÓTESES (paramétricos)
+# Tema: Análise dos Factores Associados ao Efeito do Novo Tratamento na Perda de Peso
+# Continuação do Trabalho I (Análise Exploratória)
+# Entrada : BasedeDados.txt (TAB, formato longo)   Saídas: ./tabelas/*.csv e ./fig/*.pdf
+# Pacotes : dplyr, tidyr, readr, ggplot2, car
+# ==============================================================================
+options(encoding = "UTF-8")
+
+library(car)        # carregar ANTES de dplyr para evitar conflito com recode()
+library(dplyr); library(tidyr); library(readr); library(ggplot2)
+
+dir.create("tabelas", showWarnings = FALSE); dir.create("fig", showWarnings = FALSE)
+G3 <- c("Controlo", "Placebo", "Tratamento")
+
+# ---------------------------------------------------------------- 0. Funções auxiliares
+## Cohen's d para teste t independente (positivo = primeiro grupo maior)
+cohen_d <- function(a, b) {
+  sp <- sqrt(((length(a)-1)*var(a) + (length(b)-1)*var(b))/(length(a)+length(b)-2))
+  (mean(a) - mean(b))/sp
+}
+
+## Eta² para ANOVA
+eta2 <- function(anova_obj) {
+  ss <- summary(anova_obj)[[1]]$`Sum Sq`
+  ss[1]/sum(ss)
+}
+
+## IC 95% da média
+ci_media <- function(x) {
+  m <- mean(x); se <- sd(x)/sqrt(length(x)); q <- qt(.975, length(x) - 1)
+  c(m, m - q*se, m + q*se)
+}
+
+# ---------------------------------------------------------------- 1. Dados, recodificação e variáveis
+bruto <- read_tsv("BasedeDados.txt", show_col_types = FALSE) %>% mutate(across(where(is.character), trimws))
+
+cat("Omissos:", sum(is.na(bruto)), "| Duplicados ID x VISIT:", sum(duplicated(bruto[, c("ID", "VISIT")])), "\n")
+
+d <- bruto %>%
+  pivot_wider(id_cols = c(ID, TREAT, AGE, LIVINGSTATUS, SMOKESTATUS, GENDER),
+              names_from = VISIT, values_from = WEIGHT) %>%
+  rename(IDADE = AGE) %>%
+  mutate(
+    PERDA  = PRE - POST,
+    PCT    = 100 * PERDA / PRE,
+    RESP   = as.integer(PCT >= 5),
+    TREAT3 = factor(dplyr::recode(TREAT, CONTROL = "Controlo", PLACEBO = "Placebo",
+                                  TREATMENT = "Tratamento"), levels = G3),
+    GRUPO   = factor(ifelse(TREAT == "TREATMENT", "Tratamento", "Controlo"),
+                     levels = c("Controlo", "Tratamento")),
+    FUMO2   = factor(ifelse(SMOKESTATUS == "SMOKER", "Fumador", "Não fumador"),
+                     levels = c("Fumador", "Não fumador")),
+    MARITAL = factor(ifelse(LIVINGSTATUS %in% c("WITH PARTNER", "WITH PARTNER AND CHILDREN"),
+                            "Com parceiro(a)", "Sem parceiro(a)"),
+                     levels = c("Sem parceiro(a)", "Com parceiro(a)")),
+    GENERO  = factor(dplyr::recode(GENDER, FEMALE = "Feminino", MALE = "Masculino"),
+                     levels = c("Feminino", "Masculino"))
+  )
+
+print(table(d$GRUPO)); print(table(d$FUMO2)); print(table(d$MARITAL))
+write_csv(d, "tabelas/dados_largos_recodificados.csv")
+
+trat <- d %>% filter(GRUPO == "Tratamento")
+ctrl <- d %>% filter(GRUPO == "Controlo")
+
+# ---------------------------------------------------------------- 2. Comparabilidade basal
+cat("\n== Comparabilidade basal ==\n")
+for (v in c("IDADE", "PRE")) {
+  cat("\n", v, "\n")
+  print(t.test(d[[v]][d$GRUPO == "Tratamento"], d[[v]][d$GRUPO == "Controlo"]))
+}
+for (v in c("GENERO", "FUMO2", "MARITAL")) {
+  lv <- levels(d[[v]])[1]
+  x <- tapply(d[[v]] == lv, d$GRUPO, sum)
+  n <- table(d$GRUPO)
+  cat("\n", v, "-", lv, "\n")
+  print(prop.test(x[c("Tratamento", "Controlo")], n[c("Tratamento", "Controlo")], correct = FALSE))
+}
+
+# ---------------------------------------------------------------- 3. Pressupostos
+cat("\n== Pressupostos ==\n")
+shap <- d %>% group_by(TREAT3) %>%
+  summarise(shapiro_p = shapiro.test(PERDA)$p.value, .groups = "drop")
+print(shap)
+
+cat("\nLevene (2 grupos):\n")
+print(car::leveneTest(PERDA ~ GRUPO, data = d, center = median))
+cat("\nLevene (3 grupos):\n")
+print(car::leveneTest(PERDA ~ TREAT3, data = d, center = median))
+
+# ---------------------------------------------------------------- 4. Teste t emparelhado (pré vs post) com d_z
+cat("\n== Teste t pareado (pré vs pós) ==\n")
+emparelhado <- function(s, nome) {
+  tt <- t.test(s$PRE, s$POST, paired = TRUE)
+  tibble(grupo = nome, n = nrow(s), pre = mean(s$PRE), post = mean(s$POST),
+         perda = mean(s$PERDA), ic_inf = tt$conf.int[1], ic_sup = tt$conf.int[2],
+         t = unname(tt$statistic), gl = unname(tt$parameter), p = tt$p.value,
+         d_z = mean(s$PERDA)/sd(s$PERDA))
+}
+pareado <- bind_rows(
+  lapply(G3, function(g) emparelhado(d %>% filter(TREAT3 == g), g)),
+  emparelhado(ctrl, "Controlo + placebo")
+)
+print(pareado %>% mutate(across(where(is.numeric), ~ round(.x, 4))))
+
+# ---------------------------------------------------------------- 5. Teste t independente e tamanho de efeito
+cat("\n== Teste t independente (Tratamento vs Controlo) ==\n")
+t_ind_welch <- t.test(PERDA ~ GRUPO, data = d, var.equal = FALSE)
+t_ind_student <- t.test(PERDA ~ GRUPO, data = d, var.equal = TRUE)
+d_ind <- cohen_d(trat$PERDA, ctrl$PERDA)
+
+cat("Welch:\n"); print(t_ind_welch)
+cat("Student:\n"); print(t_ind_student)
+cat("Cohen's d =", round(d_ind, 2), "\n")
+
+## Comparações adicionais (Trat vs Controlo puro, Trat vs Placebo)
+t_trat_cont <- t.test(d$PERDA[d$TREAT3 == "Tratamento"], d$PERDA[d$TREAT3 == "Controlo"], var.equal = FALSE)
+t_trat_plac <- t.test(d$PERDA[d$TREAT3 == "Tratamento"], d$PERDA[d$TREAT3 == "Placebo"], var.equal = FALSE)
+t_plac_cont <- t.test(d$PERDA[d$TREAT3 == "Placebo"], d$PERDA[d$TREAT3 == "Controlo"], var.equal = FALSE)
+
+cat("\nTratamento vs Controlo puro: t =", round(unname(t_trat_cont$statistic), 2), "p =", t_trat_cont$p.value, "\n")
+cat("Tratamento vs Placebo: t =", round(unname(t_trat_plac$statistic), 2), "p =", t_trat_plac$p.value, "\n")
+cat("Placebo vs Controlo: t =", round(unname(t_plac_cont$statistic), 2), "p =", t_plac_cont$p.value, "\n")
+
+# ---------------------------------------------------------------- 6. ANOVA a um factor, Welch e Tukey
+cat("\n== ANOVA (3 grupos) ==\n")
+anova1 <- aov(PERDA ~ TREAT3, data = d)
+print(summary(anova1))
+cat("Eta² =", round(eta2(anova1), 3), "\n")
+print(oneway.test(PERDA ~ TREAT3, data = d, var.equal = FALSE))
+print(TukeyHSD(anova1))
+
+# ---------------------------------------------------------------- 7. Factores associados (grupo tratamento) com Holm e Cohen's d
+cat("\n== Factores associados (grupo tratamento) ==\n")
+
+t_com_d <- function(formula, dados, nome, niveis = NULL) {
+  y <- dados[[all.vars(formula)[1]]]
+  g <- factor(dados[[all.vars(formula)[2]]])
+  if (is.null(niveis)) niveis <- levels(g)
+  a <- y[g == niveis[1]]; b <- y[g == niveis[2]]
+  
+  tt <- t.test(a, b)                       # Welch; diferença = média(a) - média(b)
+  sp <- sqrt(((length(a) - 1) * var(a) + (length(b) - 1) * var(b)) / (length(a) + length(b) - 2))
+  
+  tibble(factor = nome, contraste = paste(niveis[1], "-", niveis[2]),
+         n1 = length(a), n2 = length(b),
+         dif = mean(a) - mean(b),
+         ic_inf = tt$conf.int[1], ic_sup = tt$conf.int[2],
+         t = unname(tt$statistic), gl = unname(tt$parameter), p = tt$p.value,
+         d = (mean(a) - mean(b)) / sp)
+}
+
+fatores <- bind_rows(
+  t_com_d(PERDA ~ GENERO,  trat, "Género"),
+  t_com_d(PERDA ~ FUMO2,   trat, "Tabagismo"),
+  t_com_d(PERDA ~ MARITAL, trat, "Estado marital",
+          niveis = c("Com parceiro(a)", "Sem parceiro(a)"))
+) %>%
+  mutate(p_holm = p.adjust(p, method = "holm"))
+
+print(fatores %>% mutate(across(where(is.numeric), ~ round(.x, 4))))
+# ---------------------------------------------------------------- 8. Figuras
+tema <- theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+cores <- c(Controlo = "#8c8c8c", Placebo = "#e0a030", Tratamento = "#1f6fb2")
+
+## Fig 1: Boxplots da perda por grupo
+f1 <- ggplot(d, aes(TREAT3, PERDA, fill = TREAT3)) +
+  geom_boxplot(width = .5, alpha = .8, outlier.shape = NA) +
+  geom_jitter(width = .15, size = 1.5, alpha = .5) +
+  geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+  scale_fill_manual(values = cores) +
+  labs(x = NULL, y = "Perda de peso (kg)", title = "Perda de peso por grupo de tratamento") +
+  tema + theme(legend.position = "none")
+ggsave("fig/fig1_perda_grupos.pdf", f1, width = 7, height = 4.5)
+
+## Fig 2: Perda por género (grupo tratamento)
+f2 <- ggplot(trat, aes(GENERO, PERDA, fill = GENERO)) +
+  geom_boxplot(width = .5, alpha = .8, outlier.shape = NA) +
+  geom_jitter(width = .15, size = 1.5, alpha = .5) +
+  scale_fill_manual(values = c(Feminino = "#D62728", Masculino = "#1F77B4")) +
+  labs(x = NULL, y = "Perda de peso (kg)", title = "Perda de peso por género (grupo tratamento)") +
+  tema + theme(legend.position = "none")
+ggsave("fig/fig2_perda_genero.pdf", f2, width = 6, height = 4.5)
+
+## Fig 3: Interacção tratamento x género (médias e IC)
+interacao <- d %>% group_by(GRUPO, GENERO) %>%
+  summarise(m = ci_media(PERDA)[1], lo = ci_media(PERDA)[2], hi = ci_media(PERDA)[3], .groups = "drop")
+
+f3 <- ggplot(interacao, aes(GRUPO, m, colour = GENERO, group = GENERO)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(.2)) +
+  geom_line(position = position_dodge(.2)) +
+  scale_colour_manual(values = c(Feminino = "#D62728", Masculino = "#1F77B4")) +
+  labs(x = NULL, y = "Perda média (kg), IC 95%", title = "Interacção tratamento x género") +
+  tema
+ggsave("fig/fig3_interaccao.pdf", f3, width = 6, height = 4.5)
+
+cat("\nConcluído: tabelas em ./tabelas e figuras em ./fig\n")
