@@ -1,0 +1,279 @@
+# ============================================================
+# TRABALHO PRÁTICO III - ANÁLISE DE DADOS
+# TESTES DE HIPÓTESES NÃO PARAMÉTRICOS
+# Tema: Análise dos Factores Associados ao Efeito do Novo
+#       Tratamento na Perda de Peso
+# ------------------------------------------------------------
+# Versão revista: mantém a estrutura original (secções 1 a 12) e
+# acrescenta (secções 13 a 27) o que faltava para responder aos
+# objectivos. Os comentários "ACRESCENTADO" e "CORRIGIDO" indicam
+# as alterações.
+# ============================================================
+
+# 1. PACOTES (instala apenas os que faltam)  -- CORRIGIDO
+# O pacote FSA não era usado (o teste de Dunn vem do rstatix) e
+# a instalação fixa de um único pacote foi substituída por esta.
+
+pacotes <- c("tidyverse", "rstatix")
+novos <- pacotes[!(pacotes %in% installed.packages()[, "Package"])]
+if (length(novos) > 0) install.packages(novos)
+invisible(lapply(pacotes, library, character.only = TRUE))
+
+# 2. IMPORTAÇÃO DA BASE DE DADOS
+# Altere apenas o caminho se necessário (ficheiro BasedeDados.txt)
+
+caminho <- "C:/Users/asus/Downloads/BasedeDados.txt"
+if (!file.exists(caminho)) caminho <- file.choose()   # CORRIGIDO: abre a janela se o caminho falhar
+
+dados <- read.delim("C:/Users/asus/Downloads/BasedeDados.txt") %>%
+  mutate(across(where(is.character), trimws))
+str(dados)
+summary(dados)
+colSums(is.na(dados))
+cat("Duplicados ID x VISIT:", sum(duplicated(dados[, c("ID", "VISIT")])), "\n")   # ACRESCENTADO
+
+# 3. ORGANIZAÇÃO DAS VARIÁVEIS
+
+dados <- dados %>%
+  mutate(
+    Treat = factor(TREAT),
+    Visit = factor(VISIT),
+    Gender = factor(GENDER),
+    Smokingstatus = factor(SMOKESTATUS),
+    Livingstatus = factor(LIVINGSTATUS)
+  )
+
+# 4. TRANSFORMAÇÃO DOS DADOS LONGOS PARA LARGOS
+
+largo <- dados %>%
+  select(ID, TREAT, VISIT, AGE, WEIGHT,
+         GENDER, SMOKESTATUS, LIVINGSTATUS) %>%
+  pivot_wider(
+    names_from = VISIT,
+    values_from = WEIGHT
+  )
+
+print(names(largo))          # deve mostrar PRE e POST
+stopifnot(nrow(largo) == 120)  # ACRESCENTADO: 120 indivíduos
+
+# 5. CÁLCULO DA PERDA DE PESO
+
+largo <- largo %>%
+  mutate(
+    Perda = PRE - POST,
+    Percentagem = (Perda / PRE) * 100,
+    RESP = ifelse(
+      Percentagem >= 5,
+      "Respondedor",
+      "Não respondedor"
+    )
+  )
+
+# 5b. RECODIFICAÇÕES  -- ACRESCENTADO
+# (as mesmas do Trabalho II: controlo + placebo vs tratamento, etc.)
+
+largo <- largo %>%
+  mutate(
+    TREAT3   = factor(recode(TREAT, CONTROL = "Controlo", PLACEBO = "Placebo",
+                             TREATMENT = "Tratamento"),
+                      levels = c("Controlo", "Placebo", "Tratamento")),
+    GRUPO2   = factor(ifelse(TREAT == "TREATMENT", "Tratamento", "Controlo"),
+                      levels = c("Controlo", "Tratamento")),     # controlo + placebo
+    GENERO   = factor(recode(GENDER, FEMALE = "Feminino", MALE = "Masculino"),
+                      levels = c("Feminino", "Masculino")),
+    FUMO2    = factor(ifelse(SMOKESTATUS == "SMOKER", "Fumador", "Não fumador"),
+                      levels = c("Fumador", "Não fumador")),      # ex-fumador -> não fumador
+    PARCEIRO = factor(ifelse(LIVINGSTATUS %in% c("WITH PARTNER", "WITH PARTNER AND CHILDREN"),
+                             "Com parceiro(a)", "Sem parceiro(a)"),
+                      levels = c("Com parceiro(a)", "Sem parceiro(a)")),
+    FUMO3    = factor(recode(SMOKESTATUS, SMOKER = "Fumador", `QUIT-SMOKER` = "Ex-fumador",
+                             `NON-SMOKER` = "Não fumador"),
+                      levels = c("Fumador", "Ex-fumador", "Não fumador")),
+    VIVE6    = factor(LIVINGSTATUS),
+    FAIXA    = cut(AGE, breaks = c(19, 34, 49, 65), labels = c("20-34", "35-49", "50-65")),
+    RESP01   = as.integer(Percentagem >= 5)
+  )
+print(table(largo$GRUPO2)); print(table(largo$FUMO2)); print(table(largo$PARCEIRO))
+
+# 6. ANÁLISE DESCRITIVA
+
+descritiva <- largo %>%
+  group_by(TREAT) %>%
+  summarise(
+    N = n(),
+    Mediana = median(Perda, na.rm = TRUE),
+    Q1 = quantile(Perda, 0.25, na.rm = TRUE),
+    Q3 = quantile(Perda, 0.75, na.rm = TRUE),
+    Minimo = min(Perda, na.rm = TRUE),
+    Maximo = max(Perda, na.rm = TRUE),
+    Media = mean(Perda, na.rm = TRUE),                  # ACRESCENTADO
+    DP = sd(Perda, na.rm = TRUE),                       # ACRESCENTADO
+    Mediana_pct = median(Percentagem, na.rm = TRUE),    # ACRESCENTADO
+    Respondedores = sum(RESP == "Respondedor"),         # ACRESCENTADO
+    .groups = "drop"
+  )
+
+cat("\n===== ANÁLISE DESCRITIVA =====\n")
+print(descritiva)
+
+# 7. TESTE DE WILCOXON EMPARELHADO
+# Comparação do peso antes e depois em cada grupo
+
+cat("\n===== TESTE DE WILCOXON EMPARELHADO =====\n")
+
+wilcoxon <- largo %>%
+  group_by(TREAT) %>%
+  summarise(
+    N = sum(complete.cases(PRE, POST)),
+    Mediana_PRE = median(PRE, na.rm = TRUE),
+    Mediana_POST = median(POST, na.rm = TRUE),
+    Resultado = list(
+      wilcox.test(PRE, POST, paired = TRUE, exact = FALSE)
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Estatistica = map_dbl(Resultado, ~ as.numeric(.x$statistic)),
+    Valor_p = map_dbl(Resultado, ~ .x$p.value),
+    .keep = "unused"
+  ) %>%
+  mutate(
+    p_ajustado = p.adjust(Valor_p, method = "holm")   # Holm sobre as 3 comparações (1 por grupo)
+  )
+
+print(wilcoxon)
+
+# 8. TESTE DE KRUSKAL-WALLIS
+# Comparação da perda de peso entre os três grupos
+
+cat("\n===== TESTE DE KRUSKAL-WALLIS =====\n")
+
+kruskal <- kruskal.test(
+  Perda ~ TREAT,
+  data = largo
+)
+
+print(kruskal)
+cat("epsilon^2 =", unname(kruskal$statistic) / (nrow(largo) - 1), "\n")   # ACRESCENTADO (tamanho de efeito)
+
+# 9. TESTE DE DUNN
+# Comparações múltiplas entre os grupos
+
+cat("\n===== TESTE DE DUNN COM CORRECÇÃO DE HOLM =====\n")
+
+dunn <- largo %>%
+  rstatix::dunn_test(
+    Perda ~ TREAT,
+    p.adjust.method = "holm"
+  )
+
+print(dunn)
+
+# 10. SELECCIONAR O GRUPO TREATMENT
+
+tratamento <- largo %>%
+  filter(TREAT == "TREATMENT")
+
+table(tratamento$GENDER)
+
+# 11. TESTE DE MANN-WHITNEY: GÉNERO
+
+teste_genero <- wilcox.test(
+  Perda ~ GENDER,
+  data = tratamento,
+  exact = FALSE
+)
+print(teste_genero)
+
+# 12. MANN-WHITNEY: TABAGISMO
+
+table(tratamento$SMOKESTATUS)
+
+tratamento <- tratamento %>%
+  mutate(
+    Fumo = ifelse(
+      SMOKESTATUS == "SMOKER",
+      "Fumador",
+      "Outros"
+    )
+  )
+
+table(tratamento$Fumo)
+
+teste_fumo <- wilcox.test(
+  Perda ~ Fumo,
+  data = tratamento,
+  exact = FALSE
+)
+print(teste_fumo)
+
+# 12b. MANN-WHITNEY: SITUAÇÃO CONJUGAL
+
+tratamento <- tratamento %>%
+  mutate(
+    Parceiro = ifelse(
+      LIVINGSTATUS %in% c(
+        "WITH PARTNER",
+        "WITH PARTNER AND CHILDREN"
+      ),
+      "Com parceiro",
+      "Sem parceiro"
+    )
+  )
+
+table(tratamento$Parceiro)
+teste_parceiro <- wilcox.test(
+  Perda ~ Parceiro,
+  data = tratamento,
+  exact = FALSE
+)
+print(teste_parceiro)
+
+# 12c. CORRECÇÃO DE HOLM NOS SUBGRUPOS
+
+p_subgrupos <- c(
+  Genero = teste_genero$p.value,
+  Tabagismo = teste_fumo$p.value,
+  Situacao_conjugal = teste_parceiro$p.value
+)
+
+p_ajustados <- p.adjust(
+  p_subgrupos,
+  method = "holm"
+)
+print(p_ajustados)
+
+# 13. ASSOCIAÇÃO ENTRE GRUPO E RESPOSTA AO TRATAMENTO
+
+cat("\n===== TABELA DE CONTINGÊNCIA =====\n")
+
+tabela_resposta <- table(
+  largo$TREAT,
+  largo$RESP
+)
+
+print(tabela_resposta)
+
+cat("\n===== TESTE DE ASSOCIAÇÃO =====\n")
+
+teste_chi <- chisq.test(
+  tabela_resposta,
+  correct = FALSE
+)
+
+print(teste_chi$expected)
+
+if(any(teste_chi$expected < 5)) {
+  teste_resposta <- fisher.test(tabela_resposta)
+  cat("\nAplicou-se o teste exacto de Fisher.\n")
+} else {
+  teste_resposta <- teste_chi
+  cat("\nAplicou-se o teste do Qui-quadrado.\n")
+}
+
+print(teste_resposta)
+
+
+
+# ============================================================
+# FIM DO TRABALHO PRÁTICO III Podes adicionar o codigo no trabalho
